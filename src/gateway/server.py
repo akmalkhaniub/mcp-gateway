@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .cache import McpResponseCache
+from .health import McpHealthProber
 from .models import McpServerConfig, ServerHealth
 from .proxy import McpProxyRouter
 from .registry import McpServerRegistry
@@ -18,16 +21,32 @@ from .registry import McpServerRegistry
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
+def create_app(
+    registry: McpServerRegistry | None = None,
+    cache: McpResponseCache | None = None,
+    auto_probe: bool = False,
+) -> FastAPI:
     if registry is None:
         registry = McpServerRegistry()
 
+    if cache is None:
+        cache = McpResponseCache(default_ttl_seconds=60.0)
+
     router = McpProxyRouter(registry=registry)
+    prober = McpHealthProber(registry=registry)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if auto_probe:
+            prober.start(interval_seconds=30.0)
+        yield
+        prober.stop()
 
     app = FastAPI(
         title="MCP Gateway",
-        description="High-performance reverse proxy, tool aggregator, and health monitor for Model Context Protocol servers.",
-        version="0.1.0",
+        description="High-performance reverse proxy, tool aggregator, semantic cache, and health monitor for Model Context Protocol servers.",
+        version="0.2.0",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -41,6 +60,8 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
     # Store state
     app.state.registry = registry
     app.state.router = router
+    app.state.cache = cache
+    app.state.prober = prober
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -49,10 +70,11 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
         return {
             "status": "ok",
             "service": "mcp-gateway",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "servers_count": len(servers),
             "servers_healthy": healthy_count,
             "total_tools": len(registry.list_all_tools()),
+            "cache": cache.stats(),
         }
 
     @app.get("/api/servers")
@@ -71,14 +93,27 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Server '{server_id}' not found.")
         return {"status": "removed", "server_id": server_id}
 
+    @app.post("/api/servers/probe")
+    async def probe_servers() -> list[dict[str, Any]]:
+        return await prober.probe_all()
+
     @app.get("/api/tools")
     async def list_tools() -> list[dict[str, Any]]:
         tools = registry.list_all_tools()
         return [t.model_dump() for t in tools]
 
+    @app.get("/api/cache/stats")
+    async def get_cache_stats() -> dict[str, Any]:
+        return cache.stats()
+
+    @app.post("/api/cache/clear")
+    async def clear_cache() -> dict[str, Any]:
+        evicted = cache.clear()
+        return {"status": "cleared", "evicted_entries": evicted}
+
     @app.post("/mcp/aggregate")
     async def aggregate_mcp(request: Request) -> JSONResponse:
-        """Universal MCP endpoint aggregating all upstream tools."""
+        """Universal MCP endpoint aggregating all upstream tools with semantic response caching."""
         try:
             payload = await request.json()
         except Exception:
@@ -97,7 +132,7 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
                     "id": req_id,
                     "result": {
                         "protocolVersion": "2024-11-05",
-                        "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.1.0"},
+                        "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.2.0"},
                         "capabilities": {"tools": {"listChanged": True}},
                     },
                 }
@@ -131,7 +166,21 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
                         "error": {"code": -32602, "message": "Missing 'name' in tools/call params."},
                     },
                 )
+
+            # Check semantic response cache
+            match = registry.find_tool(t_name)
+            server_id = match[0].id if match else "unknown"
+            cached = cache.get(server_id, t_name, arguments)
+            if cached:
+                cached["id"] = req_id
+                if "result" in cached and isinstance(cached["result"], dict):
+                    cached["result"]["_cached"] = True
+                return JSONResponse(content=cached)
+
+            # Route to upstream server
             result = await router.route_aggregated_tool(t_name, arguments, req_id=req_id)
+            if "result" in result and not result.get("result", {}).get("isError", False):
+                cache.set(server_id, t_name, arguments, result)
             return JSONResponse(content=result)
 
         return JSONResponse(
@@ -152,6 +201,24 @@ def create_app(registry: McpServerRegistry | None = None) -> FastAPI:
                 status_code=400,
                 content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error (invalid JSON)"}},
             )
+
+        method = payload.get("method")
+        if method == "tools/call":
+            params = payload.get("params", {})
+            t_name = params.get("name", "")
+            arguments = params.get("arguments", {})
+            cached = cache.get(server_id, t_name, arguments)
+            if cached:
+                cached["id"] = payload.get("id")
+                if "result" in cached and isinstance(cached["result"], dict):
+                    cached["result"]["_cached"] = True
+                return JSONResponse(content=cached)
+
+            resp = await router.forward_to_server(server_id, payload)
+            if "result" in resp and not resp.get("result", {}).get("isError", False):
+                cache.set(server_id, t_name, arguments, resp)
+            return JSONResponse(content=resp)
+
         resp = await router.forward_to_server(server_id, payload)
         return JSONResponse(content=resp)
 

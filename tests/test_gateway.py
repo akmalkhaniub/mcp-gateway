@@ -140,3 +140,46 @@ def test_dashboard_ui_served(client: TestClient) -> None:
     resp = client.get("/")
     assert resp.status_code == 200
     assert "MCP Gateway" in resp.text
+
+
+def test_semantic_response_cache(client: TestClient) -> None:
+    # 1. Initial tool call (cache miss)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 201,
+        "method": "tools/call",
+        "params": {"name": "attractor_lint_pipeline", "arguments": {"dot_source": "digraph CachedPipeline { start -> end; }"}},
+    }
+    resp1 = client.post("/mcp/aggregate", json=payload)
+    assert resp1.status_code == 200
+    assert resp1.json()["result"].get("_cached") is None or not resp1.json()["result"].get("_cached")
+
+    # 2. Second tool call with identical arguments (cache hit!)
+    resp2 = client.post("/mcp/aggregate", json=payload)
+    assert resp2.status_code == 200
+    assert resp2.json()["result"].get("_cached") is True
+
+    # 3. Verify cache stats
+    stats_resp = client.get("/api/cache/stats")
+    assert stats_resp.status_code == 200
+    stats = stats_resp.json()
+    assert stats["hits"] >= 1
+    assert stats["cached_entries"] >= 1
+
+
+def test_cache_clear_endpoint(client: TestClient) -> None:
+    clear_resp = client.post("/api/cache/clear")
+    assert clear_resp.status_code == 200
+    assert clear_resp.json()["status"] == "cleared"
+
+    stats_resp = client.get("/api/cache/stats")
+    assert stats_resp.json()["cached_entries"] == 0
+
+
+def test_health_prober_endpoint(client: TestClient) -> None:
+    probe_resp = client.post("/api/servers/probe")
+    assert probe_resp.status_code == 200
+    results = probe_resp.json()
+    assert isinstance(results, list)
+    assert len(results) >= 1
+    assert any(r["server_id"] == "attractor-factory" and r["status"] == "healthy" for r in results)

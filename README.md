@@ -77,12 +77,15 @@ Open your browser at [http://127.0.0.1:8080](http://127.0.0.1:8080).
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | `GET` | Service status, server counts, and total tool count |
+| `/health` | `GET` | Service status, server counts, total tools, and cache stats |
 | `/api/servers` | `GET` | List all registered upstream servers and live stats |
 | `/api/servers` | `POST` | Register a new upstream MCP server |
 | `/api/servers/{id}` | `DELETE` | Deregister an upstream MCP server |
+| `/api/servers/probe` | `POST` | Trigger immediate concurrent health probe across all upstreams |
 | `/api/tools` | `GET` | Aggregated catalog of all available tools |
-| `/mcp/aggregate` | `POST` | Universal MCP JSON-RPC 2.0 endpoint |
+| `/api/cache/stats` | `GET` | Semantic response cache hits, misses, and hit ratio |
+| `/api/cache/clear` | `POST` | Invalidate all cached tool responses |
+| `/mcp/aggregate` | `POST` | Universal MCP JSON-RPC 2.0 endpoint with semantic caching |
 | `/mcp/{server_id}` | `POST` | Direct proxy to a specific upstream MCP server |
 | `/` | `GET` | Interactive HTML5 operator dashboard |
 | `/docs` | `GET` | Interactive OpenAPI / Swagger UI documentation |

@@ -278,8 +278,13 @@
         <div class="value" id="valToolsCount" style="color: var(--accent);">-</div>
       </div>
       <div class="stat-card">
+        <div class="label">Semantic Cache Ratio</div>
+        <div class="value" id="valCacheRatio" style="color: #a855f7;">-</div>
+        <small id="valCacheHits" style="color: var(--text-muted); font-size: 11px;">0 hits / 0 misses</small>
+      </div>
+      <div class="stat-card">
         <div class="label">Universal Endpoint</div>
-        <div class="value" style="font-size: 15px; font-weight: 500; font-family: monospace;">POST /mcp/aggregate</div>
+        <div class="value" style="font-size: 14px; font-weight: 500; font-family: monospace;">POST /mcp/aggregate</div>
       </div>
     </div>
 
@@ -287,7 +292,10 @@
       <div class="panel">
         <h2>
           <span>Registered Upstream Servers</span>
-          <button class="btn" style="font-size: 11px; padding: 4px 8px;" onclick="loadData()">Refresh</button>
+          <div style="display: flex; gap: 6px;">
+            <button class="btn" style="font-size: 11px; padding: 4px 8px;" onclick="probeServers()">Probe Nodes</button>
+            <button class="btn" style="font-size: 11px; padding: 4px 8px;" onclick="loadData()">Refresh</button>
+          </div>
         </h2>
         <table>
           <thead>
@@ -358,15 +366,20 @@
 
     async function loadData() {
       try {
-        const [healthRes, serversRes, toolsRes] = await Promise.all([
+        const [healthRes, serversRes, toolsRes, cacheRes] = await Promise.all([
           fetch("/health").then(r => r.json()),
           fetch("/api/servers").then(r => r.json()),
           fetch("/api/tools").then(r => r.json()),
+          fetch("/api/cache/stats").then(r => r.json()),
         ]);
 
         document.getElementById("valServersCount").textContent = healthRes.servers_count;
         document.getElementById("valHealthyCount").textContent = healthRes.servers_healthy;
         document.getElementById("valToolsCount").textContent = healthRes.total_tools;
+
+        // Cache stats
+        document.getElementById("valCacheRatio").textContent = cacheRes.hit_ratio_pct + "%";
+        document.getElementById("valCacheHits").textContent = `${cacheRes.hits} hits / ${cacheRes.misses} misses (${cacheRes.cached_entries} cached)`;
 
         // Render servers
         const sBody = document.getElementById("serversTableBody");
@@ -393,13 +406,32 @@
 
         // Tool select options
         const tSelect = document.getElementById("toolSelect");
-        tSelect.innerHTML = toolsRes.map(t => `
-          <option value="${t.name}">${t.name} (${t.server_name})</option>
-        `).join("");
-
-        onToolSelected();
+        if (tSelect.children.length === 0) {
+          tSelect.innerHTML = toolsRes.map(t => `
+            <option value="${t.name}">${t.name} (${t.server_name})</option>
+          `).join("");
+          onToolSelected();
+        }
       } catch (err) {
         console.error("Failed to load gateway data:", err);
+      }
+    }
+
+    async function probeServers() {
+      try {
+        await fetch("/api/servers/probe", { method: "POST" });
+        loadData();
+      } catch (err) {
+        console.error("Failed to probe servers:", err);
+      }
+    }
+
+    async function clearCache() {
+      try {
+        await fetch("/api/cache/clear", { method: "POST" });
+        loadData();
+      } catch (err) {
+        console.error("Failed to clear cache:", err);
       }
     }
 
