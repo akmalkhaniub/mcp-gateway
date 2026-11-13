@@ -1,0 +1,21 @@
+digraph Pipeline {
+    graph [label="MCP Gateway Factory Pipeline", rankdir="LR"];
+
+    start [shape=Mdiamond, label="Start Specification"];
+    spec_lint [shape=box, label="Lint Specs", prompt="Verify Model Context Protocol 2024-11-05 spec adherence and routing rules."];
+    build_core [shape=box, label="Build Core Gateway", prompt="Implement FastAPI reverse proxy, upstream registry, and tool aggregator."];
+    build_ui [shape=box, label="Build Operator UI", prompt="Implement zero-dependency reactive light/dark theme dashboard."];
+    run_evals [shape=box, label="Execute Test Suite", prompt="Run pytest suite for health, registration, tool routing, and JSON-RPC proxy."];
+    quality_gate [shape=diamond, label="Gate: All Tests Pass?"];
+    package_release [shape=box, label="Package Artifact", prompt="Generate wheel distribution and verify build hygiene."];
+    complete [shape=Msquare, label="Production Ready"];
+
+    start -> spec_lint;
+    spec_lint -> build_core;
+    build_core -> build_ui;
+    build_ui -> run_evals;
+    run_evals -> quality_gate;
+    quality_gate -> package_release [label="pass", condition="outcome = pass"];
+    quality_gate -> build_core [label="fail", condition="outcome = fail"];
+    package_release -> complete;
+}
