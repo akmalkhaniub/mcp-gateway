@@ -18,6 +18,8 @@ Connecting LLMs to dozens of separate MCP servers creates configuration sprawl, 
 - **Dynamic Routing**: Automatically matches `tools/call` requests by tool name and proxies them to the correct upstream server.
 - **Direct Server Proxy (`/mcp/{server_id}`)**: Targeted forwarding with latency and error tracking.
 - **Live Health Monitoring**: Exponential moving average (EMA) latency tracking, error counting, and automatic status updates.
+- **Principal Access Boundaries & HITL Governance**: Priority-ordered tool access policies matching `X-Agent-Principal` Agent Identities against server/tool glob patterns, `DRY_RUN` vs `ENFORCED` audit modes, and HMAC-SHA256 `X-Approval-Token` Human-in-the-Loop gating evaluated prior to cache lookup.
+- **Streamable HTTP Session Lifecycle**: `Mcp-Session-Id` negotiation on `initialize` and `202 Accepted` handling for `notifications/initialized`.
 - **Interactive Light/Dark Dashboard**: Human-centered operator console with an interactive tool tester and real-time node stats.
 - **Factory Provenance**: Engineered with the [Attractor Software Factory](https://github.com/akmalkhaniub/attractor-factory) DOT pipeline specification (`pipeline.dot`).
 
@@ -85,7 +87,11 @@ Open your browser at [http://127.0.0.1:8080](http://127.0.0.1:8080).
 | `/api/tools` | `GET` | Aggregated catalog of all available tools |
 | `/api/cache/stats` | `GET` | Semantic response cache hits, misses, and hit ratio |
 | `/api/cache/clear` | `POST` | Invalidate all cached tool responses |
-| `/mcp/aggregate` | `POST` | Universal MCP JSON-RPC 2.0 endpoint with semantic caching |
+| `/api/policies` | `GET` / `POST` | List or upsert Principal Access & HITL tool governance policies |
+| `/api/policies/{id}` | `DELETE` | Remove a tool governance policy |
+| `/api/policies/approval-token` | `POST` | Issue an HMAC-SHA256 scoped `X-Approval-Token` for HITL-gated tools |
+| `/api/audit/logs` | `GET` | Query recent governance & tool execution audit trail |
+| `/mcp/aggregate` | `POST` | Universal MCP JSON-RPC 2.0 endpoint with policy enforcement & semantic caching |
 | `/mcp/{server_id}` | `POST` | Direct proxy to a specific upstream MCP server |
 | `/` | `GET` | Interactive HTML5 operator dashboard |
 | `/docs` | `GET` | Interactive OpenAPI / Swagger UI documentation |

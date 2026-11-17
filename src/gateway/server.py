@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,12 @@ from fastapi.staticfiles import StaticFiles
 from .cache import McpResponseCache
 from .health import McpHealthProber
 from .models import McpServerConfig, ServerHealth
+from .policy import (
+    ApprovalTokenRequest,
+    AuditLogEntry,
+    McpGovernanceEngine,
+    ToolAccessPolicy,
+)
 from .proxy import McpProxyRouter
 from .registry import McpServerRegistry
 
@@ -24,6 +32,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 def create_app(
     registry: McpServerRegistry | None = None,
     cache: McpResponseCache | None = None,
+    governance: McpGovernanceEngine | None = None,
     auto_probe: bool = False,
 ) -> FastAPI:
     if registry is None:
@@ -31,6 +40,9 @@ def create_app(
 
     if cache is None:
         cache = McpResponseCache(default_ttl_seconds=60.0)
+
+    if governance is None:
+        governance = McpGovernanceEngine()
 
     router = McpProxyRouter(registry=registry)
     prober = McpHealthProber(registry=registry)
@@ -61,7 +73,88 @@ def create_app(
     app.state.registry = registry
     app.state.router = router
     app.state.cache = cache
+    app.state.governance = governance
     app.state.prober = prober
+
+    async def _execute_governed_tool_call(
+        request: Request,
+        server_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        req_id: Any,
+        forward_fn: Any,
+    ) -> JSONResponse:
+        """Enforce Principal Access Boundary & HITL policy before cache/upstream execution."""
+        principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+        approval_token = request.headers.get("X-Approval-Token")
+        start_t = time.monotonic()
+
+        decision = governance.evaluate(
+            principal=principal,
+            server_id=server_id,
+            tool_name=tool_name,
+            approval_token=approval_token,
+        )
+        if not decision.allowed:
+            latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+            governance.record_audit(
+                AuditLogEntry(
+                    principal=principal,
+                    server_id=server_id,
+                    tool_name=tool_name,
+                    decision="denied",
+                    policy_id=decision.matched_policy_id,
+                    mode=decision.mode.value,
+                    cached=False,
+                    latency_ms=latency_ms,
+                    reason=decision.reason,
+                )
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32003,
+                        "message": decision.reason,
+                        "data": decision.model_dump(),
+                    },
+                },
+            )
+
+        cached = cache.get(server_id, tool_name, arguments)
+        if cached:
+            cached["id"] = req_id
+            if "result" in cached and isinstance(cached["result"], dict):
+                cached["result"]["_cached"] = True
+            result = cached
+            was_cached = True
+        else:
+            result = await forward_fn()
+            if "result" in result and not result.get("result", {}).get("isError", False):
+                cache.set(server_id, tool_name, arguments, result)
+            was_cached = False
+
+        latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+        audit_decision = "dry_run_would_deny" if decision.dry_run_would_deny else "allowed"
+        governance.record_audit(
+            AuditLogEntry(
+                principal=principal,
+                server_id=server_id,
+                tool_name=tool_name,
+                decision=audit_decision,
+                policy_id=decision.matched_policy_id,
+                mode=decision.mode.value,
+                cached=was_cached,
+                latency_ms=latency_ms,
+                reason=decision.reason,
+            )
+        )
+        headers: dict[str, str] = {}
+        if decision.dry_run_would_deny:
+            headers["X-MCP-Policy-Audit"] = "DRY_RUN_WOULD_DENY"
+        return JSONResponse(content=result, headers=headers)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -75,6 +168,10 @@ def create_app(
             "servers_healthy": healthy_count,
             "total_tools": len(registry.list_all_tools()),
             "cache": cache.stats(),
+            "governance": {
+                "policies_count": len(governance.list_policies()),
+                "audit_events_count": governance.audit_count(),
+            },
         }
 
     @app.get("/api/servers")
@@ -111,6 +208,46 @@ def create_app(
         evicted = cache.clear()
         return {"status": "cleared", "evicted_entries": evicted}
 
+    @app.get("/api/policies")
+    async def list_policies() -> list[dict[str, Any]]:
+        return [p.model_dump() for p in governance.list_policies()]
+
+    @app.post("/api/policies")
+    async def upsert_policy(policy: ToolAccessPolicy) -> dict[str, Any]:
+        saved = governance.upsert_policy(policy)
+        return {"status": "saved", "policy": saved.model_dump()}
+
+    @app.delete("/api/policies/{policy_id}")
+    async def delete_policy(policy_id: str) -> dict[str, Any]:
+        removed = governance.remove_policy(policy_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Policy '{policy_id}' not found.")
+        return {"status": "removed", "policy_id": policy_id}
+
+    @app.post("/api/policies/approval-token")
+    async def issue_approval_token(req: ApprovalTokenRequest) -> dict[str, Any]:
+        token, exp = governance.issue_approval_token(
+            principal=req.principal,
+            server_id=req.server_id,
+            tool_name=req.tool_name,
+            ttl_seconds=req.ttl_seconds,
+        )
+        return {
+            "approval_token": token,
+            "principal": req.principal,
+            "server_id": req.server_id,
+            "tool_name": req.tool_name,
+            "expires_at": exp,
+        }
+
+    @app.get("/api/audit/logs")
+    async def list_audit_logs(
+        limit: int = 100,
+        principal: str | None = None,
+        decision: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return governance.list_audit_logs(limit=limit, principal=principal, decision=decision)
+
     @app.post("/mcp/aggregate")
     async def aggregate_mcp(request: Request) -> JSONResponse:
         """Universal MCP endpoint aggregating all upstream tools with semantic response caching."""
@@ -124,9 +261,11 @@ def create_app(
 
         method = payload.get("method")
         req_id = payload.get("id")
+        session_id = request.headers.get("Mcp-Session-Id") or f"mcp-{secrets.token_hex(8)}"
 
         if method == "initialize":
             return JSONResponse(
+                headers={"Mcp-Session-Id": session_id},
                 content={
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -135,7 +274,14 @@ def create_app(
                         "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.2.0"},
                         "capabilities": {"tools": {"listChanged": True}},
                     },
-                }
+                },
+            )
+
+        if method == "notifications/initialized":
+            return JSONResponse(
+                status_code=202,
+                headers={"Mcp-Session-Id": session_id},
+                content={"status": "accepted"},
             )
 
         if method == "ping":
@@ -167,21 +313,16 @@ def create_app(
                     },
                 )
 
-            # Check semantic response cache
             match = registry.find_tool(t_name)
             server_id = match[0].id if match else "unknown"
-            cached = cache.get(server_id, t_name, arguments)
-            if cached:
-                cached["id"] = req_id
-                if "result" in cached and isinstance(cached["result"], dict):
-                    cached["result"]["_cached"] = True
-                return JSONResponse(content=cached)
-
-            # Route to upstream server
-            result = await router.route_aggregated_tool(t_name, arguments, req_id=req_id)
-            if "result" in result and not result.get("result", {}).get("isError", False):
-                cache.set(server_id, t_name, arguments, result)
-            return JSONResponse(content=result)
+            return await _execute_governed_tool_call(
+                request=request,
+                server_id=server_id,
+                tool_name=t_name,
+                arguments=arguments,
+                req_id=req_id,
+                forward_fn=lambda: router.route_aggregated_tool(t_name, arguments, req_id=req_id),
+            )
 
         return JSONResponse(
             status_code=404,
@@ -207,17 +348,14 @@ def create_app(
             params = payload.get("params", {})
             t_name = params.get("name", "")
             arguments = params.get("arguments", {})
-            cached = cache.get(server_id, t_name, arguments)
-            if cached:
-                cached["id"] = payload.get("id")
-                if "result" in cached and isinstance(cached["result"], dict):
-                    cached["result"]["_cached"] = True
-                return JSONResponse(content=cached)
-
-            resp = await router.forward_to_server(server_id, payload)
-            if "result" in resp and not resp.get("result", {}).get("isError", False):
-                cache.set(server_id, t_name, arguments, resp)
-            return JSONResponse(content=resp)
+            return await _execute_governed_tool_call(
+                request=request,
+                server_id=server_id,
+                tool_name=t_name,
+                arguments=arguments,
+                req_id=payload.get("id"),
+                forward_fn=lambda: router.forward_to_server(server_id, payload),
+            )
 
         resp = await router.forward_to_server(server_id, payload)
         return JSONResponse(content=resp)
