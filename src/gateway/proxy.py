@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from .guardrails import CircuitBreakerManager
 from .models import McpServerConfig, ServerHealth
 from .registry import McpServerRegistry
 
@@ -14,8 +15,13 @@ from .registry import McpServerRegistry
 class McpProxyRouter:
     """Intelligent reverse proxy routing MCP JSON-RPC requests to appropriate upstream servers."""
 
-    def __init__(self, registry: McpServerRegistry) -> None:
+    def __init__(
+        self,
+        registry: McpServerRegistry,
+        circuit_breaker: CircuitBreakerManager | None = None,
+    ) -> None:
         self.registry = registry
+        self.circuit_breaker = circuit_breaker or CircuitBreakerManager()
 
     async def forward_to_server(self, server_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         config = self.registry.get_server(server_id)
@@ -33,12 +39,24 @@ class McpProxyRouter:
                 "error": {"code": -32001, "message": f"Server '{server_id}' is currently disabled."},
             }
 
+        if not self.circuit_breaker.allow_request(server_id):
+            cb_info = self.circuit_breaker.status(server_id)
+            return {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "error": {
+                    "code": -32002,
+                    "message": f"Circuit breaker OPEN for server '{server_id}'. Retry in {cb_info['retry_in_seconds']}s.",
+                },
+            }
+
         start_t = time.monotonic()
         try:
             # If standard mock or local test server
             if not config.endpoint_url or "127.0.0.1" in config.endpoint_url:
                 latency = round((time.monotonic() - start_t) * 1000, 2)
                 self.registry.record_call(server_id, latency, is_error=False)
+                self.circuit_breaker.record_success(server_id)
                 method = payload.get("method")
                 req_id = payload.get("id")
 
@@ -73,11 +91,16 @@ class McpProxyRouter:
                 resp = await client.post(config.endpoint_url, json=payload, headers=headers)
                 latency = round((time.monotonic() - start_t) * 1000, 2)
                 self.registry.record_call(server_id, latency, is_error=resp.is_error)
+                if resp.is_error:
+                    self.circuit_breaker.record_failure(server_id)
+                else:
+                    self.circuit_breaker.record_success(server_id)
                 return resp.json()
 
         except Exception as exc:
             latency = round((time.monotonic() - start_t) * 1000, 2)
             self.registry.record_call(server_id, latency, is_error=True)
+            self.circuit_breaker.record_failure(server_id)
             return {
                 "jsonrpc": "2.0",
                 "id": payload.get("id"),

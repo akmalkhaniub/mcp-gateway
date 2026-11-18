@@ -1,6 +1,6 @@
 [project]
 name = "mcp-gateway"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-Performance Reverse Proxy, Registry, Semantic Cache & Health Dashboard for Model Context Protocol (MCP) Servers"
 readme = "README.md"
 requires-python = ">=3.11"

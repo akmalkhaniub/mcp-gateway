@@ -87,6 +87,8 @@ Open your browser at [http://127.0.0.1:8080](http://127.0.0.1:8080).
 | `/api/tools` | `GET` | Aggregated catalog of all available tools |
 | `/api/cache/stats` | `GET` | Semantic response cache hits, misses, and hit ratio |
 | `/api/cache/clear` | `POST` | Invalidate all cached tool responses |
+| `/api/guardrails/status` | `GET` | Token-bucket rate limiter metrics and per-server circuit breaker states |
+| `/api/guardrails/circuits/{server_id}/reset` | `POST` | Manually reset an OPEN upstream circuit breaker back to CLOSED |
 | `/api/policies` | `GET` / `POST` | List or upsert Principal Access & HITL tool governance policies |
 | `/api/policies/{id}` | `DELETE` | Remove a tool governance policy |
 | `/api/policies/approval-token` | `POST` | Issue an HMAC-SHA256 scoped `X-Approval-Token` for HITL-gated tools |

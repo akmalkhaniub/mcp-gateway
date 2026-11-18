@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .cache import McpResponseCache
+from .guardrails import CircuitBreakerManager, TokenBucketRateLimiter
 from .health import McpHealthProber
 from .models import McpServerConfig, ServerHealth
 from .policy import (
@@ -33,6 +34,8 @@ def create_app(
     registry: McpServerRegistry | None = None,
     cache: McpResponseCache | None = None,
     governance: McpGovernanceEngine | None = None,
+    rate_limiter: TokenBucketRateLimiter | None = None,
+    circuit_breaker: CircuitBreakerManager | None = None,
     auto_probe: bool = False,
 ) -> FastAPI:
     if registry is None:
@@ -44,7 +47,13 @@ def create_app(
     if governance is None:
         governance = McpGovernanceEngine()
 
-    router = McpProxyRouter(registry=registry)
+    if rate_limiter is None:
+        rate_limiter = TokenBucketRateLimiter(capacity=60.0, refill_rate_per_sec=2.0)
+
+    if circuit_breaker is None:
+        circuit_breaker = CircuitBreakerManager(failure_threshold=3, recovery_timeout_seconds=30.0)
+
+    router = McpProxyRouter(registry=registry, circuit_breaker=circuit_breaker)
     prober = McpHealthProber(registry=registry)
 
     @asynccontextmanager
@@ -56,8 +65,8 @@ def create_app(
 
     app = FastAPI(
         title="MCP Gateway",
-        description="High-performance reverse proxy, tool aggregator, semantic cache, and health monitor for Model Context Protocol servers.",
-        version="0.2.0",
+        description="High-performance reverse proxy, tool aggregator, semantic cache, rate limiter, circuit breaker, and health monitor for Model Context Protocol servers.",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
@@ -74,6 +83,8 @@ def create_app(
     app.state.router = router
     app.state.cache = cache
     app.state.governance = governance
+    app.state.rate_limiter = rate_limiter
+    app.state.circuit_breaker = circuit_breaker
     app.state.prober = prober
 
     async def _execute_governed_tool_call(
@@ -84,10 +95,41 @@ def create_app(
         req_id: Any,
         forward_fn: Any,
     ) -> JSONResponse:
-        """Enforce Principal Access Boundary & HITL policy before cache/upstream execution."""
+        """Enforce Rate Limiter, Principal Access Boundary & HITL policy before cache/upstream execution."""
         principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
         approval_token = request.headers.get("X-Approval-Token")
         start_t = time.monotonic()
+
+        # 1. Token-bucket rate limit check
+        allowed_rate, retry_after = rate_limiter.consume(principal)
+        if not allowed_rate:
+            latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+            governance.record_audit(
+                AuditLogEntry(
+                    principal=principal,
+                    server_id=server_id,
+                    tool_name=tool_name,
+                    decision="rate_limited",
+                    policy_id="rate_limiter",
+                    mode="enforce",
+                    cached=False,
+                    latency_ms=latency_ms,
+                    reason=f"Rate limit exceeded for principal '{principal}'. Retry after {retry_after}s.",
+                )
+            )
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32004,
+                        "message": f"Rate limit exceeded for principal '{principal}'. Retry after {retry_after}s.",
+                        "data": {"retry_after_seconds": retry_after},
+                    },
+                },
+            )
 
         decision = governance.evaluate(
             principal=principal,
@@ -163,7 +205,7 @@ def create_app(
         return {
             "status": "ok",
             "service": "mcp-gateway",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "servers_count": len(servers),
             "servers_healthy": healthy_count,
             "total_tools": len(registry.list_all_tools()),
@@ -171,6 +213,10 @@ def create_app(
             "governance": {
                 "policies_count": len(governance.list_policies()),
                 "audit_events_count": governance.audit_count(),
+            },
+            "guardrails": {
+                "rate_limiter": rate_limiter.stats(),
+                "circuits": circuit_breaker.all_statuses(),
             },
         }
 
@@ -207,6 +253,18 @@ def create_app(
     async def clear_cache() -> dict[str, Any]:
         evicted = cache.clear()
         return {"status": "cleared", "evicted_entries": evicted}
+
+    @app.get("/api/guardrails/status")
+    async def get_guardrails_status() -> dict[str, Any]:
+        return {
+            "rate_limiter": rate_limiter.stats(),
+            "circuits": circuit_breaker.all_statuses(),
+        }
+
+    @app.post("/api/guardrails/circuits/{server_id}/reset")
+    async def reset_circuit_breaker(server_id: str) -> dict[str, Any]:
+        circuit_breaker.reset(server_id)
+        return {"status": "reset", "circuit": circuit_breaker.status(server_id)}
 
     @app.get("/api/policies")
     async def list_policies() -> list[dict[str, Any]]:
