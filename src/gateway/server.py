@@ -26,6 +26,13 @@ from .policy import (
 )
 from .proxy import McpProxyRouter
 from .registry import McpServerRegistry
+from .telemetry import (
+    GatewaySpan,
+    GatewayTelemetryCollector,
+    TraceContext,
+    attach_trace_meta_to_response,
+    extract_trace_context,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -36,6 +43,8 @@ def create_app(
     governance: McpGovernanceEngine | None = None,
     rate_limiter: TokenBucketRateLimiter | None = None,
     circuit_breaker: CircuitBreakerManager | None = None,
+    telemetry: GatewayTelemetryCollector | None = None,
+    router: McpProxyRouter | None = None,
     auto_probe: bool = False,
 ) -> FastAPI:
     if registry is None:
@@ -53,7 +62,11 @@ def create_app(
     if circuit_breaker is None:
         circuit_breaker = CircuitBreakerManager(failure_threshold=3, recovery_timeout_seconds=30.0)
 
-    router = McpProxyRouter(registry=registry, circuit_breaker=circuit_breaker)
+    if telemetry is None:
+        telemetry = GatewayTelemetryCollector()
+
+    if router is None:
+        router = McpProxyRouter(registry=registry, circuit_breaker=circuit_breaker)
     prober = McpHealthProber(registry=registry)
 
     @asynccontextmanager
@@ -85,7 +98,44 @@ def create_app(
     app.state.governance = governance
     app.state.rate_limiter = rate_limiter
     app.state.circuit_breaker = circuit_breaker
+    app.state.telemetry = telemetry
     app.state.prober = prober
+
+    def _trace_headers(ctx: TraceContext, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {"traceparent": ctx.traceparent, "X-Trace-Id": ctx.trace_id}
+        if ctx.tracestate:
+            headers["tracestate"] = ctx.tracestate
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _record_span(
+        ctx: TraceContext,
+        operation: str,
+        server_id: str,
+        principal: str,
+        status: str,
+        latency_ms: float,
+        tool_name: str | None = None,
+        cached: bool = False,
+    ) -> None:
+        telemetry.record_span(
+            GatewaySpan(
+                trace_id=ctx.trace_id,
+                span_id=ctx.span_id,
+                parent_span_id=ctx.parent_span_id,
+                operation=operation,
+                server_id=server_id,
+                tool_name=tool_name,
+                principal=principal,
+                status=status,
+                cached=cached,
+                latency_ms=latency_ms,
+                source=ctx.source,
+                tracestate=ctx.tracestate,
+                baggage=ctx.baggage,
+            )
+        )
 
     async def _execute_governed_tool_call(
         request: Request,
@@ -93,6 +143,7 @@ def create_app(
         tool_name: str,
         arguments: dict[str, Any],
         req_id: Any,
+        trace_ctx: TraceContext,
         forward_fn: Any,
     ) -> JSONResponse:
         """Enforce Rate Limiter, Principal Access Boundary & HITL policy before cache/upstream execution."""
@@ -114,19 +165,22 @@ def create_app(
                     mode="enforce",
                     cached=False,
                     latency_ms=latency_ms,
+                    trace_id=trace_ctx.trace_id,
+                    span_id=trace_ctx.span_id,
                     reason=f"Rate limit exceeded for principal '{principal}'. Retry after {retry_after}s.",
                 )
             )
+            _record_span(trace_ctx, "mcp.tools/call", server_id, principal, "rate_limited", latency_ms, tool_name)
             return JSONResponse(
                 status_code=429,
-                headers={"Retry-After": str(retry_after)},
+                headers=_trace_headers(trace_ctx, {"Retry-After": str(retry_after)}),
                 content={
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "error": {
                         "code": -32004,
                         "message": f"Rate limit exceeded for principal '{principal}'. Retry after {retry_after}s.",
-                        "data": {"retry_after_seconds": retry_after},
+                        "data": {"retry_after_seconds": retry_after, "trace_id": trace_ctx.trace_id},
                     },
                 },
             )
@@ -149,18 +203,24 @@ def create_app(
                     mode=decision.mode.value,
                     cached=False,
                     latency_ms=latency_ms,
+                    trace_id=trace_ctx.trace_id,
+                    span_id=trace_ctx.span_id,
                     reason=decision.reason,
                 )
             )
+            _record_span(trace_ctx, "mcp.tools/call", server_id, principal, "denied", latency_ms, tool_name)
+            err_data = decision.model_dump()
+            err_data["trace_id"] = trace_ctx.trace_id
             return JSONResponse(
                 status_code=403,
+                headers=_trace_headers(trace_ctx),
                 content={
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "error": {
                         "code": -32003,
                         "message": decision.reason,
-                        "data": decision.model_dump(),
+                        "data": err_data,
                     },
                 },
             )
@@ -179,6 +239,7 @@ def create_app(
             was_cached = False
 
         latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+        has_error = "error" in result or bool(result.get("result", {}).get("isError", False))
         audit_decision = "dry_run_would_deny" if decision.dry_run_would_deny else "allowed"
         governance.record_audit(
             AuditLogEntry(
@@ -190,13 +251,28 @@ def create_app(
                 mode=decision.mode.value,
                 cached=was_cached,
                 latency_ms=latency_ms,
+                trace_id=trace_ctx.trace_id,
+                span_id=trace_ctx.span_id,
                 reason=decision.reason,
             )
         )
-        headers: dict[str, str] = {}
-        if decision.dry_run_would_deny:
-            headers["X-MCP-Policy-Audit"] = "DRY_RUN_WOULD_DENY"
-        return JSONResponse(content=result, headers=headers)
+        _record_span(
+            trace_ctx,
+            "mcp.tools/call",
+            server_id,
+            principal,
+            "error" if has_error else "ok",
+            latency_ms,
+            tool_name=tool_name,
+            cached=was_cached,
+        )
+        enriched = attach_trace_meta_to_response(
+            result,
+            trace_ctx,
+            extra={"cached": was_cached, "latency_ms": latency_ms},
+        )
+        extra_hdrs = {"X-MCP-Policy-Audit": "DRY_RUN_WOULD_DENY"} if decision.dry_run_would_deny else None
+        return JSONResponse(content=enriched, headers=_trace_headers(trace_ctx, extra_hdrs))
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -218,6 +294,7 @@ def create_app(
                 "rate_limiter": rate_limiter.stats(),
                 "circuits": circuit_breaker.all_statuses(),
             },
+            "telemetry": telemetry.stats(),
         }
 
     @app.get("/api/servers")
@@ -303,8 +380,28 @@ def create_app(
         limit: int = 100,
         principal: str | None = None,
         decision: str | None = None,
+        trace_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return governance.list_audit_logs(limit=limit, principal=principal, decision=decision)
+        return governance.list_audit_logs(
+            limit=limit,
+            principal=principal,
+            decision=decision,
+            trace_id=trace_id,
+        )
+
+    @app.get("/api/telemetry/spans")
+    async def list_telemetry_spans(
+        limit: int = 100,
+        trace_id: str | None = None,
+        server_id: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return telemetry.list_spans(
+            limit=limit,
+            trace_id=trace_id,
+            server_id=server_id,
+            status=status,
+        )
 
     @app.post("/mcp/aggregate")
     async def aggregate_mcp(request: Request) -> JSONResponse:
@@ -320,30 +417,37 @@ def create_app(
         method = payload.get("method")
         req_id = payload.get("id")
         session_id = request.headers.get("Mcp-Session-Id") or f"mcp-{secrets.token_hex(8)}"
+        trace_ctx = extract_trace_context(request.headers, payload)
 
         if method == "initialize":
             return JSONResponse(
-                headers={"Mcp-Session-Id": session_id},
-                content={
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.2.0"},
-                        "capabilities": {"tools": {"listChanged": True}},
+                headers=_trace_headers(trace_ctx, {"Mcp-Session-Id": session_id}),
+                content=attach_trace_meta_to_response(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.3.0"},
+                            "capabilities": {"tools": {"listChanged": True}},
+                        },
                     },
-                },
+                    trace_ctx,
+                ),
             )
 
         if method == "notifications/initialized":
             return JSONResponse(
                 status_code=202,
-                headers={"Mcp-Session-Id": session_id},
+                headers=_trace_headers(trace_ctx, {"Mcp-Session-Id": session_id}),
                 content={"status": "accepted"},
             )
 
         if method == "ping":
-            return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
+            return JSONResponse(
+                headers=_trace_headers(trace_ctx),
+                content={"jsonrpc": "2.0", "id": req_id, "result": {}},
+            )
 
         if method == "tools/list":
             all_tools = registry.list_all_tools()
@@ -355,15 +459,23 @@ def create_app(
                 }
                 for t in all_tools
             ]
-            return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {"tools": formatted}})
+            return JSONResponse(
+                headers=_trace_headers(trace_ctx),
+                content=attach_trace_meta_to_response(
+                    {"jsonrpc": "2.0", "id": req_id, "result": {"tools": formatted}},
+                    trace_ctx,
+                ),
+            )
 
         if method == "tools/call":
             params = payload.get("params", {})
             t_name = params.get("name")
             arguments = params.get("arguments", {})
+            raw_meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
             if not t_name:
                 return JSONResponse(
                     status_code=400,
+                    headers=_trace_headers(trace_ctx),
                     content={
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -379,11 +491,19 @@ def create_app(
                 tool_name=t_name,
                 arguments=arguments,
                 req_id=req_id,
-                forward_fn=lambda: router.route_aggregated_tool(t_name, arguments, req_id=req_id),
+                trace_ctx=trace_ctx,
+                forward_fn=lambda: router.route_aggregated_tool(
+                    t_name,
+                    arguments,
+                    req_id=req_id,
+                    trace_context=trace_ctx,
+                    meta=raw_meta,
+                ),
             )
 
         return JSONResponse(
             status_code=404,
+            headers=_trace_headers(trace_ctx),
             content={
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -402,6 +522,7 @@ def create_app(
             )
 
         method = payload.get("method")
+        trace_ctx = extract_trace_context(request.headers, payload)
         if method == "tools/call":
             params = payload.get("params", {})
             t_name = params.get("name", "")
@@ -412,11 +533,24 @@ def create_app(
                 tool_name=t_name,
                 arguments=arguments,
                 req_id=payload.get("id"),
-                forward_fn=lambda: router.forward_to_server(server_id, payload),
+                trace_ctx=trace_ctx,
+                forward_fn=lambda: router.forward_to_server(server_id, payload, trace_context=trace_ctx),
             )
 
-        resp = await router.forward_to_server(server_id, payload)
-        return JSONResponse(content=resp)
+        start_t = time.monotonic()
+        resp = await router.forward_to_server(server_id, payload, trace_context=trace_ctx)
+        latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+        principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+        _record_span(
+            trace_ctx,
+            f"mcp.{method or 'proxy'}",
+            server_id,
+            principal,
+            "error" if "error" in resp else "ok",
+            latency_ms,
+        )
+        enriched = attach_trace_meta_to_response(resp, trace_ctx, extra={"latency_ms": latency_ms})
+        return JSONResponse(content=enriched, headers=_trace_headers(trace_ctx))
 
     # Static / Dashboard UI
     if STATIC_DIR.exists():

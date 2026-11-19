@@ -75,6 +75,8 @@ class AuditLogEntry(BaseModel):
     mode: str = EnforcementMode.ENFORCED.value
     cached: bool = False
     latency_ms: float = 0.0
+    trace_id: str | None = None
+    span_id: str | None = None
     reason: str = ""
 
 
@@ -252,6 +254,7 @@ class McpGovernanceEngine:
         limit: int = 100,
         principal: str | None = None,
         decision: str | None = None,
+        trace_id: str | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
             items = list(self._audit_logs)
@@ -259,6 +262,8 @@ class McpGovernanceEngine:
             items = [e for e in items if e.principal == principal]
         if decision:
             items = [e for e in items if e.decision == decision]
+        if trace_id:
+            items = [e for e in items if e.trace_id == trace_id]
         if limit > 0:
             items = items[-limit:]
         return [e.model_dump() for e in reversed(items)]
