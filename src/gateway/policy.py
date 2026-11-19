@@ -164,6 +164,11 @@ class McpGovernanceEngine:
 
         return True, "Valid HITL approval token."
 
+    def is_tool_visible(self, principal: str, server_id: str, tool_name: str) -> bool:
+        """Return False if an ENFORCED DENY policy blocks this principal from seeing the tool in tools/list."""
+        decision = self.evaluate(principal=principal, server_id=server_id, tool_name=tool_name)
+        return not (decision.effect == PolicyEffect.DENY and not decision.allowed)
+
     def evaluate(
         self,
         principal: str,

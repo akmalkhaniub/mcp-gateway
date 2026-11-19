@@ -43,6 +43,10 @@ class McpToolInfo(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    annotations: dict[str, Any] = Field(default_factory=dict)
+    definition_digest: str = ""
+    quarantined: bool = False
+    quarantine_reason: str = ""
 
 
 class McpServerStats(BaseModel):

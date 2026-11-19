@@ -83,12 +83,31 @@ def create_app(
         lifespan=lifespan,
     )
 
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "MCP_CORS_ALLOWED_ORIGINS",
+            "http://127.0.0.1:8000,http://localhost:8000,http://localhost:6274",
+        ).split(",")
+        if origin.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Mcp-Session-Id",
+            "MCP-Protocol-Version",
+            "X-Agent-Principal",
+            "X-Approval-Token",
+            "traceparent",
+            "tracestate",
+            "baggage",
+        ],
+        expose_headers=["WWW-Authenticate", "Mcp-Session-Id", "X-Trace-Id", "Retry-After"],
     )
 
     # Store state
@@ -318,9 +337,19 @@ def create_app(
         return await prober.probe_all()
 
     @app.get("/api/tools")
-    async def list_tools() -> list[dict[str, Any]]:
-        tools = registry.list_all_tools()
-        return [t.model_dump() for t in tools]
+    async def list_tools(include_quarantined: bool = True) -> list[dict[str, Any]]:
+        tools = registry.list_all_tools(include_quarantined=include_quarantined)
+        return [
+            {
+                **t.model_dump(),
+                "untrusted_server": t.server_id != "attractor-factory",
+            }
+            for t in tools
+        ]
+
+    @app.get("/api/notifications")
+    async def list_notifications() -> list[dict[str, Any]]:
+        return registry.list_notifications()
 
     @app.get("/api/cache/stats")
     async def get_cache_stats() -> dict[str, Any]:
@@ -350,6 +379,7 @@ def create_app(
     @app.post("/api/policies")
     async def upsert_policy(policy: ToolAccessPolicy) -> dict[str, Any]:
         saved = governance.upsert_policy(policy)
+        registry.emit_tools_list_changed("policy_upserted")
         return {"status": "saved", "policy": saved.model_dump()}
 
     @app.delete("/api/policies/{policy_id}")
@@ -357,6 +387,7 @@ def create_app(
         removed = governance.remove_policy(policy_id)
         if not removed:
             raise HTTPException(status_code=404, detail=f"Policy '{policy_id}' not found.")
+        registry.emit_tools_list_changed("policy_deleted")
         return {"status": "removed", "policy_id": policy_id}
 
     @app.post("/api/policies/approval-token")
@@ -450,14 +481,17 @@ def create_app(
             )
 
         if method == "tools/list":
+            principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
             all_tools = registry.list_all_tools()
             formatted = [
                 {
                     "name": t.name,
                     "description": f"[{t.server_name}] {t.description}".strip(),
                     "inputSchema": t.input_schema,
+                    **({"annotations": t.annotations} if t.annotations else {}),
                 }
                 for t in all_tools
+                if governance.is_tool_visible(principal=principal, server_id=t.server_id, tool_name=t.name)
             ]
             return JSONResponse(
                 headers=_trace_headers(trace_ctx),
