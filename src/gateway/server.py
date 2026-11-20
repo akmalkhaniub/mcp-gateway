@@ -575,6 +575,23 @@ def create_app(
         resp = await router.forward_to_server(server_id, payload, trace_context=trace_ctx)
         latency_ms = round((time.monotonic() - start_t) * 1000, 2)
         principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+        if method == "tools/list" and isinstance(resp.get("result"), dict) and isinstance(resp["result"].get("tools"), list):
+            quarantined_names = {
+                t.name
+                for t in registry.list_all_tools(include_quarantined=True)
+                if t.server_id == server_id and t.quarantined
+            }
+            resp["result"]["tools"] = [
+                tool
+                for tool in resp["result"]["tools"]
+                if isinstance(tool, dict)
+                and tool.get("name") not in quarantined_names
+                and governance.is_tool_visible(
+                    principal=principal,
+                    server_id=server_id,
+                    tool_name=str(tool.get("name", "")),
+                )
+            ]
         _record_span(
             trace_ctx,
             f"mcp.{method or 'proxy'}",
