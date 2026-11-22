@@ -580,6 +580,11 @@ def create_app(
                 status_code=400,
                 content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error (invalid JSON)"}},
             )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request (payload must be a JSON object)"}},
+            )
 
         method = payload.get("method")
         req_id = payload.get("id")
@@ -791,6 +796,11 @@ def create_app(
             return JSONResponse(
                 status_code=400,
                 content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error (invalid JSON)"}},
+            )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request (payload must be a JSON object)"}},
             )
 
         method = payload.get("method")

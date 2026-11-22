@@ -101,7 +101,8 @@ class StatelessHandleManager:
         ttl_seconds: int | None = None,
     ) -> str:
         now = int(time.time())
-        exp = now + (ttl_seconds or self.default_ttl_seconds)
+        ttl = self.default_ttl_seconds if ttl_seconds is None else ttl_seconds
+        exp = now + ttl
         claims = {
             "sub": principal,
             "srv": server_id,
@@ -135,8 +136,18 @@ class StatelessHandleManager:
         if not hmac.compare_digest(provided_sig, expected_sig):
             raise StatelessHandleError("State handle HMAC signature mismatch (tampering rejected).")
 
+        if not isinstance(claims, dict):
+            raise StatelessHandleError("Corrupted state handle claims payload.")
+
         current = time.time() if now is None else now
-        if current >= float(claims.get("exp", 0)):
+        try:
+            exp_val = float(claims.get("exp", 0))
+            iat_val = int(claims["iat"])
+            exp_int = int(claims["exp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StatelessHandleError(f"Malformed state handle timestamps: {exc}") from exc
+
+        if current >= exp_val:
             raise StatelessHandleError("State handle has expired.")
 
         if claims.get("sub") != expected_principal:
@@ -148,8 +159,8 @@ class StatelessHandleManager:
             principal=str(claims["sub"]),
             server_id=str(claims["srv"]),
             cursor=str(claims["cur"]),
-            issued_at=int(claims["iat"]),
-            expires_at=int(claims["exp"]),
+            issued_at=iat_val,
+            expires_at=exp_int,
         )
 
 

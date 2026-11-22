@@ -237,10 +237,13 @@ def is_scope_sufficient(
     Enforce least-privilege OAuth scope checks when the caller authenticated with a scoped JWT.
 
     - Unscoped dev-fallback principals pass through to policy engine rules.
-    - Scoped JWTs require `mcp:admin`, `tool:<name>`, `mcp:write` (for non-readOnly tools), or `mcp:read` (for readOnlyHint=True).
+    - OAuth JWTs with empty scopes are denied; otherwise require `mcp:admin`,
+      `tool:<name>`, `mcp:write` (for non-readOnly tools), or `mcp:read` (for readOnlyHint=True).
     """
-    if caller.auth_method != "oauth2_bearer_jwt" or not caller.scopes:
+    if caller.auth_method != "oauth2_bearer_jwt":
         return True
+    if not caller.scopes:
+        return False
     if "mcp:admin" in caller.scopes or f"tool:{tool_name}" in caller.scopes:
         return True
     is_read_only = bool((annotations or {}).get("readOnlyHint", False))

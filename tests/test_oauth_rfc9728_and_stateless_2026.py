@@ -288,3 +288,58 @@ def test_stateless_2026_mode_handles_and_mcp_tasks_routing() -> None:
     )
     assert replay.status_code == 403
     assert "principal mismatch" in replay.json()["error"]["message"]
+
+
+def test_empty_scope_jwt_ttl_zero_and_non_object_jsonrpc() -> None:
+    import pytest
+    from gateway.stateless import StatelessHandleError
+
+    app, oauth, _, handles = _make_oauth_app(auth_mode="enforced")
+    client = TestClient(app)
+
+    # 1. Empty-scope OAuth JWT must NOT bypass least-privilege scope checks
+    empty_scope_jwt = mint_hs256_jwt(
+        {
+            "iss": "https://auth.example.com",
+            "sub": "unscoped-agent",
+            "aud": oauth.resource,
+            "scope": "",
+            "exp": int(time.time()) + 300,
+        },
+        oauth.jwt_secret,
+    )
+    listed = client.post(
+        "/mcp/aggregate",
+        headers={"Authorization": f"Bearer {empty_scope_jwt}"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert listed.status_code == 200
+    assert listed.json()["result"]["tools"] == []
+
+    denied = client.post(
+        "/mcp/aggregate",
+        headers={"Authorization": f"Bearer {empty_scope_jwt}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "attractor_lint_pipeline", "arguments": {"dot_source": "digraph G {}"}},
+        },
+    )
+    assert denied.status_code == 403
+    assert "insufficient_scope" in denied.headers.get("www-authenticate", "")
+
+    # 2. ttl_seconds=0 must produce an immediately expired handle rather than falling back to default TTL
+    zero_ttl_handle = handles.mint_handle(
+        principal="worker-1",
+        server_id="aggregate",
+        cursor="c0",
+        ttl_seconds=0,
+    )
+    with pytest.raises(StatelessHandleError, match="expired"):
+        handles.verify_handle(zero_ttl_handle, expected_principal="worker-1")
+
+    # 3. Non-object JSON payload returns JSON-RPC -32600 instead of 500
+    bad_shape = client.post("/mcp/aggregate", json=["not", "an", "object"])
+    assert bad_shape.status_code == 400
+    assert bad_shape.json()["error"]["code"] == -32600
