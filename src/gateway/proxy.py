@@ -31,6 +31,7 @@ class McpProxyRouter:
         server_id: str,
         payload: dict[str, Any],
         trace_context: TraceContext | None = None,
+        upstream_bearer_token: str | None = None,
     ) -> dict[str, Any]:
         config = self.registry.get_server(server_id)
         if not config:
@@ -75,10 +76,30 @@ class McpProxyRouter:
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema,
+                            **({"annotations": t.annotations} if t.annotations else {}),
                         }
                         for t in self.registry._tools.get(server_id, [])
                     ]
                     return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}
+
+                if method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+                    params = outbound_payload.get("params", {})
+                    task_id = params.get("taskId") or params.get("task_id") or "unknown"
+                    task_status = "cancelled" if method == "tasks/cancel" else (
+                        params.get("status") or "working"
+                    )
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "task": {
+                                "taskId": task_id,
+                                "serverId": server_id,
+                                "status": task_status,
+                                "method": method,
+                            }
+                        },
+                    }
 
                 if method == "tools/call":
                     params = outbound_payload.get("params", {})
@@ -100,6 +121,8 @@ class McpProxyRouter:
                 client_kwargs["transport"] = self._transport
             async with httpx.AsyncClient(**client_kwargs) as client:
                 headers = {"Content-Type": "application/json", **config.headers}
+                if upstream_bearer_token:
+                    headers["Authorization"] = f"Bearer {upstream_bearer_token}"
                 if trace_context:
                     headers = inject_trace_into_headers(headers, trace_context)
                 resp = await client.post(config.endpoint_url, json=outbound_payload, headers=headers)
@@ -128,6 +151,7 @@ class McpProxyRouter:
         req_id: Any = 1,
         trace_context: TraceContext | None = None,
         meta: dict[str, Any] | None = None,
+        upstream_bearer_token: str | None = None,
     ) -> dict[str, Any]:
         match = self.registry.find_tool(tool_name)
         if not match:
@@ -147,4 +171,9 @@ class McpProxyRouter:
             "method": "tools/call",
             "params": params,
         }
-        return await self.forward_to_server(server_cfg.id, rpc_payload, trace_context=trace_context)
+        return await self.forward_to_server(
+            server_cfg.id,
+            rpc_payload,
+            trace_context=trace_context,
+            upstream_bearer_token=upstream_bearer_token,
+        )

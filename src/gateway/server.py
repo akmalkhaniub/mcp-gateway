@@ -14,6 +14,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .auth import (
+    AuthChallengeError,
+    GatewayOAuthSettings,
+    OAuthTokenExchanger,
+    VerifiedPrincipal,
+    authenticate_mcp_request,
+    build_protected_resource_metadata,
+    build_www_authenticate_header,
+    is_scope_sufficient,
+)
 from .cache import McpResponseCache
 from .guardrails import CircuitBreakerManager, TokenBucketRateLimiter
 from .health import McpHealthProber
@@ -26,6 +36,13 @@ from .policy import (
 )
 from .proxy import McpProxyRouter
 from .registry import McpServerRegistry
+from .stateless import (
+    ProtocolMode,
+    StatelessHandleError,
+    StatelessHandleManager,
+    negotiate_protocol_mode,
+    parse_task_handle,
+)
 from .telemetry import (
     GatewaySpan,
     GatewayTelemetryCollector,
@@ -46,6 +63,10 @@ def create_app(
     telemetry: GatewayTelemetryCollector | None = None,
     router: McpProxyRouter | None = None,
     auto_probe: bool = False,
+    oauth_settings: GatewayOAuthSettings | None = None,
+    token_exchanger: OAuthTokenExchanger | None = None,
+    handle_manager: StatelessHandleManager | None = None,
+    default_protocol_mode: ProtocolMode | None = None,
 ) -> FastAPI:
     if registry is None:
         registry = McpServerRegistry()
@@ -68,6 +89,9 @@ def create_app(
     if router is None:
         router = McpProxyRouter(registry=registry, circuit_breaker=circuit_breaker)
     prober = McpHealthProber(registry=registry)
+    oauth_cfg = oauth_settings or GatewayOAuthSettings()
+    exchanger = token_exchanger or OAuthTokenExchanger(gateway_resource=oauth_cfg.resource)
+    handles = handle_manager or StatelessHandleManager()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -119,6 +143,9 @@ def create_app(
     app.state.circuit_breaker = circuit_breaker
     app.state.telemetry = telemetry
     app.state.prober = prober
+    app.state.oauth_settings = oauth_cfg
+    app.state.token_exchanger = exchanger
+    app.state.handle_manager = handles
 
     def _trace_headers(ctx: TraceContext, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {"traceparent": ctx.traceparent, "X-Trace-Id": ctx.trace_id}
@@ -156,6 +183,76 @@ def create_app(
             )
         )
 
+    def _authenticate_or_401(
+        request: Request,
+        trace_ctx: TraceContext,
+    ) -> VerifiedPrincipal | JSONResponse:
+        try:
+            return authenticate_mcp_request(request, oauth_cfg)
+        except AuthChallengeError as exc:
+            www_auth = build_www_authenticate_header(
+                request,
+                oauth_cfg,
+                error=exc.error,
+                description=exc.description,
+                scope=exc.required_scope,
+            )
+            return JSONResponse(
+                status_code=exc.status_code,
+                headers=_trace_headers(trace_ctx, {"WWW-Authenticate": www_auth}),
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32001 if exc.status_code == 401 else -32003,
+                        "message": exc.description,
+                        "data": {"error": exc.error, "trace_id": trace_ctx.trace_id},
+                    },
+                },
+            )
+
+    def _exchange_upstream_token(caller: VerifiedPrincipal, server_id: str) -> str | None:
+        if caller.auth_method != "oauth2_bearer_jwt":
+            return None
+        cfg = registry.get_server(server_id)
+        if not cfg or not cfg.endpoint_url:
+            return None
+        return exchanger.exchange_for_upstream(
+            caller=caller,
+            server_id=server_id,
+            upstream_audience=cfg.endpoint_url,
+        )
+
+    def _verify_stateless_handle(
+        payload: dict[str, Any],
+        caller: VerifiedPrincipal,
+        trace_ctx: TraceContext,
+    ) -> JSONResponse | None:
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            return None
+        meta = params.get("_meta")
+        if not isinstance(meta, dict) or "state_handle" not in meta:
+            return None
+        raw_handle = meta.get("state_handle")
+        try:
+            handles.verify_handle(str(raw_handle), expected_principal=caller.principal)
+        except StatelessHandleError as exc:
+            return JSONResponse(
+                status_code=403,
+                headers=_trace_headers(trace_ctx),
+                content={
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "error": {
+                        "code": -32003,
+                        "message": str(exc),
+                        "data": {"trace_id": trace_ctx.trace_id},
+                    },
+                },
+            )
+        return None
+
     async def _execute_governed_tool_call(
         request: Request,
         server_id: str,
@@ -164,11 +261,43 @@ def create_app(
         req_id: Any,
         trace_ctx: TraceContext,
         forward_fn: Any,
+        caller: VerifiedPrincipal | None = None,
+        tool_annotations: dict[str, Any] | None = None,
     ) -> JSONResponse:
-        """Enforce Rate Limiter, Principal Access Boundary & HITL policy before cache/upstream execution."""
-        principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+        """Enforce OAuth scope, Rate Limiter, Principal Access Boundary & HITL policy before execution."""
+        if caller is None:
+            auth_res = _authenticate_or_401(request, trace_ctx)
+            if isinstance(auth_res, JSONResponse):
+                return auth_res
+            caller = auth_res
+        principal = caller.principal
         approval_token = request.headers.get("X-Approval-Token")
         start_t = time.monotonic()
+
+        if not is_scope_sufficient(caller, tool_annotations, tool_name):
+            latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+            _record_span(trace_ctx, "mcp.tools/call", server_id, principal, "insufficient_scope", latency_ms, tool_name)
+            required = "mcp:read" if (tool_annotations or {}).get("readOnlyHint") else "mcp:write"
+            www_auth = build_www_authenticate_header(
+                request,
+                oauth_cfg,
+                error="insufficient_scope",
+                description=f"Caller scopes {caller.scopes} insufficient for tool '{tool_name}'.",
+                scope=required,
+            )
+            return JSONResponse(
+                status_code=403,
+                headers=_trace_headers(trace_ctx, {"WWW-Authenticate": www_auth}),
+                content={
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32003,
+                        "message": f"Insufficient OAuth scope for tool '{tool_name}'. Required: {required}.",
+                        "data": {"required_scope": required, "trace_id": trace_ctx.trace_id},
+                    },
+                },
+            )
 
         # 1. Token-bucket rate limit check
         allowed_rate, retry_after = rate_limiter.consume(principal)
@@ -301,6 +430,8 @@ def create_app(
             "status": "ok",
             "service": "mcp-gateway",
             "version": "0.3.0",
+            "oauth_mode": oauth_cfg.auth_mode,
+            "protocol_mode": (default_protocol_mode or ProtocolMode.LEGACY_2024).value,
             "servers_count": len(servers),
             "servers_healthy": healthy_count,
             "total_tools": len(registry.list_all_tools()),
@@ -434,6 +565,11 @@ def create_app(
             status=status,
         )
 
+    @app.get("/.well-known/oauth-protected-resource")
+    async def oauth_protected_resource_metadata(request: Request) -> dict[str, Any]:
+        """RFC 9728 OAuth 2.0 Protected Resource Metadata discovery endpoint."""
+        return build_protected_resource_metadata(oauth_cfg, base_url=str(request.base_url))
+
     @app.post("/mcp/aggregate")
     async def aggregate_mcp(request: Request) -> JSONResponse:
         """Universal MCP endpoint aggregating all upstream tools with semantic response caching."""
@@ -447,41 +583,77 @@ def create_app(
 
         method = payload.get("method")
         req_id = payload.get("id")
-        session_id = request.headers.get("Mcp-Session-Id") or f"mcp-{secrets.token_hex(8)}"
         trace_ctx = extract_trace_context(request.headers, payload)
+        protocol_mode, protocol_version = negotiate_protocol_mode(
+            request.headers,
+            payload,
+            default_mode=default_protocol_mode,
+        )
+
+        auth_res = _authenticate_or_401(request, trace_ctx)
+        if isinstance(auth_res, JSONResponse):
+            return auth_res
+        caller = auth_res
+
+        handle_err = _verify_stateless_handle(payload, caller, trace_ctx)
+        if handle_err is not None:
+            return handle_err
+
+        session_id = request.headers.get("Mcp-Session-Id") or f"mcp-{secrets.token_hex(8)}"
+        extra_resp_headers: dict[str, str] = {"MCP-Protocol-Version": protocol_version}
+        if protocol_mode == ProtocolMode.LEGACY_2024:
+            extra_resp_headers["Mcp-Session-Id"] = session_id
+
+        def _stateless_meta_extra(server_id: str = "aggregate", cursor: str = "ok") -> dict[str, Any]:
+            if protocol_mode != ProtocolMode.STATELESS_2026:
+                return {}
+            return {
+                "protocolVersion": protocol_version,
+                "stateless": True,
+                "state_handle": handles.mint_handle(
+                    principal=caller.principal,
+                    server_id=server_id,
+                    cursor=cursor,
+                ),
+            }
 
         if method == "initialize":
             return JSONResponse(
-                headers=_trace_headers(trace_ctx, {"Mcp-Session-Id": session_id}),
+                headers=_trace_headers(trace_ctx, extra_resp_headers),
                 content=attach_trace_meta_to_response(
                     {
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "result": {
-                            "protocolVersion": "2024-11-05",
+                            "protocolVersion": protocol_version,
                             "serverInfo": {"name": "mcp-gateway-aggregator", "version": "0.3.0"},
-                            "capabilities": {"tools": {"listChanged": True}},
+                            "capabilities": {
+                                "tools": {"listChanged": True},
+                                "tasks": {"list": True, "cancel": True},
+                                "stateless": protocol_mode == ProtocolMode.STATELESS_2026,
+                            },
                         },
                     },
                     trace_ctx,
+                    extra=_stateless_meta_extra("aggregate", "initialized"),
                 ),
             )
 
         if method == "notifications/initialized":
             return JSONResponse(
                 status_code=202,
-                headers=_trace_headers(trace_ctx, {"Mcp-Session-Id": session_id}),
+                headers=_trace_headers(trace_ctx, extra_resp_headers),
                 content={"status": "accepted"},
             )
 
         if method == "ping":
             return JSONResponse(
-                headers=_trace_headers(trace_ctx),
+                headers=_trace_headers(trace_ctx, extra_resp_headers),
                 content={"jsonrpc": "2.0", "id": req_id, "result": {}},
             )
 
         if method == "tools/list":
-            principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+            principal = caller.principal
             all_tools = registry.list_all_tools()
             formatted = [
                 {
@@ -492,14 +664,68 @@ def create_app(
                 }
                 for t in all_tools
                 if governance.is_tool_visible(principal=principal, server_id=t.server_id, tool_name=t.name)
+                and is_scope_sufficient(caller, t.annotations, t.name)
             ]
             return JSONResponse(
-                headers=_trace_headers(trace_ctx),
+                headers=_trace_headers(trace_ctx, extra_resp_headers),
                 content=attach_trace_meta_to_response(
                     {"jsonrpc": "2.0", "id": req_id, "result": {"tools": formatted}},
                     trace_ctx,
+                    extra=_stateless_meta_extra("aggregate", f"tools:{len(formatted)}"),
                 ),
             )
+
+        if method in {"tasks/get", "tasks/update", "tasks/cancel"}:
+            params = payload.get("params", {})
+            raw_task_id = str(params.get("taskId") or params.get("task_id") or "").strip()
+            parsed = parse_task_handle(raw_task_id)
+            if not parsed:
+                return JSONResponse(
+                    status_code=400,
+                    headers=_trace_headers(trace_ctx, extra_resp_headers),
+                    content={
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": "Invalid taskId handle. Expected '{server_id}:{task_id}'."},
+                    },
+                )
+            target_server_id, upstream_task_id = parsed
+            try:
+                upstream_token = _exchange_upstream_token(caller, target_server_id)
+            except AuthChallengeError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    headers=_trace_headers(trace_ctx, extra_resp_headers),
+                    content={"jsonrpc": "2.0", "id": req_id, "error": {"code": -32003, "message": exc.description}},
+                )
+            forwarded_payload = {
+                **payload,
+                "params": {**params, "taskId": upstream_task_id},
+            }
+            start_t = time.monotonic()
+            fwd_kwargs: dict[str, Any] = {"trace_context": trace_ctx}
+            if upstream_token is not None:
+                fwd_kwargs["upstream_bearer_token"] = upstream_token
+            resp = await router.forward_to_server(
+                target_server_id,
+                forwarded_payload,
+                **fwd_kwargs,
+            )
+            latency_ms = round((time.monotonic() - start_t) * 1000, 2)
+            _record_span(
+                trace_ctx,
+                f"mcp.{method}",
+                target_server_id,
+                caller.principal,
+                "error" if "error" in resp else "ok",
+                latency_ms,
+            )
+            enriched = attach_trace_meta_to_response(
+                resp,
+                trace_ctx,
+                extra={"latency_ms": latency_ms, **_stateless_meta_extra(target_server_id, upstream_task_id)},
+            )
+            return JSONResponse(headers=_trace_headers(trace_ctx, extra_resp_headers), content=enriched)
 
         if method == "tools/call":
             params = payload.get("params", {})
@@ -509,7 +735,7 @@ def create_app(
             if not t_name:
                 return JSONResponse(
                     status_code=400,
-                    headers=_trace_headers(trace_ctx),
+                    headers=_trace_headers(trace_ctx, extra_resp_headers),
                     content={
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -519,6 +745,15 @@ def create_app(
 
             match = registry.find_tool(t_name)
             server_id = match[0].id if match else "unknown"
+            tool_annotations = match[1].annotations if match else None
+            try:
+                upstream_token = _exchange_upstream_token(caller, server_id) if match else None
+            except AuthChallengeError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    headers=_trace_headers(trace_ctx, extra_resp_headers),
+                    content={"jsonrpc": "2.0", "id": req_id, "error": {"code": -32003, "message": exc.description}},
+                )
             return await _execute_governed_tool_call(
                 request=request,
                 server_id=server_id,
@@ -526,18 +761,21 @@ def create_app(
                 arguments=arguments,
                 req_id=req_id,
                 trace_ctx=trace_ctx,
+                caller=caller,
+                tool_annotations=tool_annotations,
                 forward_fn=lambda: router.route_aggregated_tool(
                     t_name,
                     arguments,
                     req_id=req_id,
                     trace_context=trace_ctx,
                     meta=raw_meta,
+                    **({"upstream_bearer_token": upstream_token} if upstream_token is not None else {}),
                 ),
             )
 
         return JSONResponse(
             status_code=404,
-            headers=_trace_headers(trace_ctx),
+            headers=_trace_headers(trace_ctx, extra_resp_headers),
             content={
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -557,10 +795,32 @@ def create_app(
 
         method = payload.get("method")
         trace_ctx = extract_trace_context(request.headers, payload)
+        auth_res = _authenticate_or_401(request, trace_ctx)
+        if isinstance(auth_res, JSONResponse):
+            return auth_res
+        caller = auth_res
+
+        handle_err = _verify_stateless_handle(payload, caller, trace_ctx)
+        if handle_err is not None:
+            return handle_err
+
+        try:
+            upstream_token = _exchange_upstream_token(caller, server_id)
+        except AuthChallengeError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                headers=_trace_headers(trace_ctx),
+                content={"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32003, "message": exc.description}},
+            )
+
         if method == "tools/call":
             params = payload.get("params", {})
             t_name = params.get("name", "")
             arguments = params.get("arguments", {})
+            tool_match = next(
+                (t for t in registry.list_all_tools(include_quarantined=True) if t.server_id == server_id and t.name == t_name),
+                None,
+            )
             return await _execute_governed_tool_call(
                 request=request,
                 server_id=server_id,
@@ -568,13 +828,25 @@ def create_app(
                 arguments=arguments,
                 req_id=payload.get("id"),
                 trace_ctx=trace_ctx,
-                forward_fn=lambda: router.forward_to_server(server_id, payload, trace_context=trace_ctx),
+                caller=caller,
+                tool_annotations=tool_match.annotations if tool_match else None,
+                forward_fn=lambda: router.forward_to_server(
+                    server_id,
+                    payload,
+                    trace_context=trace_ctx,
+                    **({"upstream_bearer_token": upstream_token} if upstream_token is not None else {}),
+                ),
             )
 
         start_t = time.monotonic()
-        resp = await router.forward_to_server(server_id, payload, trace_context=trace_ctx)
+        resp = await router.forward_to_server(
+            server_id,
+            payload,
+            trace_context=trace_ctx,
+            **({"upstream_bearer_token": upstream_token} if upstream_token is not None else {}),
+        )
         latency_ms = round((time.monotonic() - start_t) * 1000, 2)
-        principal = request.headers.get("X-Agent-Principal", "anonymous").strip() or "anonymous"
+        principal = caller.principal
         if method == "tools/list" and isinstance(resp.get("result"), dict) and isinstance(resp["result"].get("tools"), list):
             quarantined_names = {
                 t.name
@@ -591,6 +863,7 @@ def create_app(
                     server_id=server_id,
                     tool_name=str(tool.get("name", "")),
                 )
+                and is_scope_sufficient(caller, tool.get("annotations"), str(tool.get("name", "")))
             ]
         _record_span(
             trace_ctx,
